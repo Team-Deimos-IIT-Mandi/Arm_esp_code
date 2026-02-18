@@ -13,7 +13,7 @@ struct __attribute__((packed)) CommandPacketB {
 struct __attribute__((packed)) FeedbackPacketB {
     char    header[2]      = {'F', 'B'};
     int32_t motor_pos[3]   = {0, 0, 0}; // encoder steps
-    char    footer         = '';
+    char    footer         = '\n';
 };                                // Total: 15 bytes
 
 #endif
