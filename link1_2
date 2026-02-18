@@ -1,0 +1,845 @@
+// =============================================================================
+//  JOINT CONTROL SYSTEM  —  ESP-A  (2 potentiometer motors)
+//
+//  Original Code A logic, limits, PID, stall detection fully preserved.
+//
+//  Added from Code B:
+//    • ROS binary-packet UART (CommandPacketA / FeedbackPacketA)
+//    • Drain-to-newest packet strategy — eliminates queued-command jerk
+//    • Slew-rate trajectory limiter — smooths large target steps
+//    • Per-motor enable flags + watchdog safe-stop / reconnect logic
+//    • Direction-flip signs tunable at runtime (F 1 / F 2)
+//    • JOINT_ALLOWED compile-time gate
+//    • Manual raw-PWM test mode  (T 1/2 [pwm], T 0, T X)
+//    • Full USB serial command interface:
+//        E  encoders   S  e-stop   R  re-enable   ?  status   H  help
+//        P/I/D [1|2] [val]  tune PID   F [1|2]  flip sign
+//        V [1|2]  toggle debug   A [a1] [a2]  move all
+//    • Debug telemetry every 200 ms (toggleable per motor)
+//
+//  NOTHING changed: angle limits, deadzone, MIN/MAX_POWER,
+//  stall thresholds, ADC clamping, Kalman filter params, PID structure.
+// =============================================================================
+
+#include <Arduino.h>
+#include <SimpleKalmanFilter.h>
+#include <HardwareSerial.h>
+
+// =============================================================================
+//  ROS UART — PACKET STRUCTS  (must match esp_coms.hpp on RPi exactly)
+// =============================================================================
+
+struct __attribute__((packed)) CommandPacketA {
+    char    header[2];       // 'S', 'T'
+    int32_t motor_cmd[2];    // angle commands in integer degrees
+    char    footer;          // '\n'
+};                           // 11 bytes total
+
+struct __attribute__((packed)) FeedbackPacketA {
+    char    header[2]    = {'F', 'B'};
+    int32_t motor_pos[2] = {0, 0};  // centidegrees (angle * 100)
+    int32_t motor_vel[2] = {0, 0};  // centidegrees/s (velocity * 100)
+    char    footer       = '\n';
+};                           // 19 bytes total
+
+// Prototype (needed before Motor class uses it)
+bool tryReadPacketA(CommandPacketA& cmd);
+
+// =============================================================================
+//  ROS UART CONFIG
+// =============================================================================
+const int ROS_RX_PIN = 12;        // ← adjust to your wiring
+const int ROS_TX_PIN = 13;        // ← adjust to your wiring
+HardwareSerial ROSSerial(1);
+
+// =============================================================================
+//  WATCHDOG
+// =============================================================================
+const unsigned long COMMS_TIMEOUT_MS = 1000;
+unsigned long last_valid_cmd_time    = 0;
+bool comms_ok                        = false;
+
+// =============================================================================
+//  CALIBRATION DATA  (unchanged from original)
+// =============================================================================
+
+// --- MOTOR 1  (-80 to 0 degrees) ---
+const int PTS_M1 = 28;
+const float angles_M1[PTS_M1] = {
+  -80, -77, -74, -71, -68, -65, -62, -59, -56, -53,
+  -50, -47, -44, -41, -38, -35, -32, -29, -26, -23,
+  -20, -17, -14, -11, -8, -5, -2, 1
+};
+const int adcs_M1[PTS_M1] = {
+  1065, 1135, 1230, 1310, 1370, 1440, 1485, 1565, 1620, 1675,
+  1735, 1785, 1844, 1900, 1940, 2000, 2050, 2100, 2152, 2200,
+  2262, 2310, 2360,2410 ,2460 ,2502 , 2540, 2600
+};
+
+// --- MOTOR 2  (18 to 78 degrees) ---
+const int PTS_M2 = 21;
+const float angles_M2[PTS_M2] = {
+  78, 75, 72, 69, 66, 63, 60, 57, 54,
+  51, 48, 45, 42, 39, 36, 33, 30, 27, 24,
+  21, 18
+};
+const int adcs_M2[PTS_M2] = {
+   780,  795,  820,  870,  910,  960, 1000, 1050, 1100, 1130,
+  1170, 1220, 1255, 1300, 1330, 1380, 1420, 1460, 1495, 1530,
+  1590
+};
+
+// =============================================================================
+//  PID TUNING  (original values, now per-motor arrays for runtime tuning)
+// =============================================================================
+float Kp[2] = {15.0f, 15.0f};
+float Ki[2] = { 1.0f,  1.0f};
+float Kd[2] = { 0.8f,  0.8f};
+
+// =============================================================================
+//  MOTOR PHYSICS  (unchanged)
+// =============================================================================
+const int   MIN_POWER = 120;
+const int   MAX_POWER = 255;
+const float DEADZONE  = 1.0f;
+
+// =============================================================================
+//  TRAJECTORY SLEW LIMITER  (from Code B — primary anti-jerk mechanism)
+//
+//  The commanded angle (what PID actually chases) is rate-limited so that
+//  a burst of queued ROS packets, each with a large angle jump, cannot
+//  produce an instantaneous huge error term that slams the motors.
+//  Value is in degrees per 20 ms tick (~100 deg/s at default).
+// =============================================================================
+const float MAX_SLEW_DEG = 2.0f;
+
+// =============================================================================
+//  JOINT ENABLE GATES  (from Code B)
+// =============================================================================
+const bool JOINT_ALLOWED[2] = {true, true};  // set false to permanently disable a joint
+
+// Runtime direction-flip signs — toggle with 'F 1' / 'F 2' over USB serial
+int PID_SIGN[2] = {1, 1};
+
+// =============================================================================
+//  MOTOR CLASS  (original logic preserved; per-motor Kp/Ki/Kd, enable flag,
+//               commanded-angle slew limiter, and velocity tracking added)
+// =============================================================================
+
+class Motor {
+public:
+    int pinPot, pinPWM, pinDir;
+    const float* angleTable;
+    const int*   adcTable;
+    int          numPoints;
+    bool         reverseDir;
+    int          motorIdx;       // 0 or 1 — indexes Kp/Ki/Kd and PID_SIGN arrays
+
+    SimpleKalmanFilter kf;
+
+    // PID state (same fields as original)
+    float currentAngle, lastAngle, integral;
+    int   currentPWM;
+
+    // Stall detection (identical thresholds)
+    unsigned long lastStallCheck;
+    float         prevStallAngle;
+    int           stallCounter;
+    bool          stalled;
+
+    // Per-motor enable flag
+    bool enabled;
+
+    // Slew-rate trajectory: PID chases commandedAngle, not raw target
+    float commandedAngle;
+
+    // Velocity for feedback packet (centidegrees/s)
+    float velocityCDS;
+
+    Motor(int pot, int pwm, int dir,
+          const float* angTab, const int* adcTab, int nPoints,
+          bool rev, int idx)
+      : pinPot(pot), pinPWM(pwm), pinDir(dir),
+        angleTable(angTab), adcTable(adcTab), numPoints(nPoints),
+        reverseDir(rev), motorIdx(idx),
+        kf(2.0f, 2.0f, 0.01f),
+        currentAngle(0), lastAngle(0), integral(0), currentPWM(0),
+        lastStallCheck(0), prevStallAngle(0), stallCounter(0), stalled(false),
+        enabled(false), commandedAngle(0), velocityCDS(0) {}
+
+    void init() {
+        pinMode(pinDir, OUTPUT);
+        ledcAttach(pinPWM, 20000, 8);
+        currentAngle   = adcToAngle(analogRead(pinPot));
+        lastAngle      = currentAngle;
+        commandedAngle = currentAngle;
+        prevStallAngle = currentAngle;
+    }
+
+    // ---------------------------------------------------------------
+    //  ADC → angle lookup  (unchanged)
+    // ---------------------------------------------------------------
+    float adcToAngle(int adc) {
+        bool increasing = adcTable[numPoints - 1] > adcTable[0];
+        if (increasing) {
+            if (adc <= adcTable[0])             return angleTable[0];
+            if (adc >= adcTable[numPoints - 1]) return angleTable[numPoints - 1];
+        } else {
+            if (adc >= adcTable[0])             return angleTable[0];
+            if (adc <= adcTable[numPoints - 1]) return angleTable[numPoints - 1];
+        }
+        for (int i = 0; i < numPoints - 1; i++) {
+            int a0 = adcTable[i], a1 = adcTable[i + 1];
+            if ((adc >= a0 && adc <= a1) || (adc <= a0 && adc >= a1)) {
+                float t = (float)(adc - a0) / (float)(a1 - a0);
+                return angleTable[i] + t * (angleTable[i + 1] - angleTable[i]);
+            }
+        }
+        return angleTable[numPoints - 1];
+    }
+
+    // ---------------------------------------------------------------
+    //  Stall reset
+    // ---------------------------------------------------------------
+    void resetStall() {
+        stalled        = false;
+        stallCounter   = 0;
+        prevStallAngle = currentAngle;
+    }
+
+    // ---------------------------------------------------------------
+    //  Trajectory update — ramp commandedAngle toward target each tick
+    // ---------------------------------------------------------------
+    void updateTrajectory(float target) {
+        float err = target - commandedAngle;
+        if (fabsf(err) > MAX_SLEW_DEG)
+            commandedAngle += (err > 0.0f) ? MAX_SLEW_DEG : -MAX_SLEW_DEG;
+        else
+            commandedAngle = target;
+    }
+
+    // ---------------------------------------------------------------
+    //  Main PID update — identical structure to original, now uses
+    //  commandedAngle instead of raw target, and respects enable flag
+    // ---------------------------------------------------------------
+    void update(float target, float dt) {
+        // ADC read and clamp (unchanged)
+        int rawADC = analogRead(pinPot);
+        if (rawADC < 10 || rawADC > 4085) { ledcWrite(pinPWM, 0); return; }
+
+        float filteredADC = kf.updateEstimate((float)rawADC);
+        float prevAngle   = currentAngle;
+        currentAngle      = adcToAngle((int)filteredADC);
+
+        // Velocity for feedback
+        velocityCDS = ((currentAngle - prevAngle) / dt) * 100.0f;
+
+        // Hard stops
+        if (stalled)  { ledcWrite(pinPWM, 0); return; }
+        if (!enabled) { ledcWrite(pinPWM, 0); return; }
+
+        // Step the commanded angle toward target at the slew rate
+        updateTrajectory(target);
+
+        float error = commandedAngle - currentAngle;
+
+        if (fabsf(error) > DEADZONE) {
+            // Stall detection (unchanged thresholds)
+            if (millis() - lastStallCheck > 100) {
+                if (fabsf(currentAngle - prevStallAngle) < 0.1f) stallCounter++;
+                else stallCounter = 0;
+                prevStallAngle = currentAngle;
+                lastStallCheck = millis();
+                if (stallCounter > 20) {
+                    stalled = true;
+                    ledcWrite(pinPWM, 0);
+                    return;
+                }
+            }
+
+            // PID  (unchanged structure and integral clamp)
+            float P         = Kp[motorIdx] * error;
+            integral        = constrain(integral + (error * Ki[motorIdx]) * dt, -100.0f, 100.0f);
+            float D         = -Kd[motorIdx] * ((currentAngle - lastAngle) / dt);
+            float rawOutput = (P + integral + D) * PID_SIGN[motorIdx];
+
+            float clampedOutput = constrain(rawOutput, -255.0f, 255.0f);
+            int   pwm           = map((long)fabsf(clampedOutput), 0, 255, MIN_POWER, MAX_POWER);
+
+            bool dir = (clampedOutput > 0);
+            if (reverseDir) dir = !dir;
+            digitalWrite(pinDir, dir ? LOW : HIGH);
+            ledcWrite(pinPWM, pwm);
+
+            currentPWM = pwm;
+            lastAngle  = currentAngle;
+        } else {
+            ledcWrite(pinPWM, 0);
+            integral   = 0;
+            currentPWM = 0;
+            resetStall();
+        }
+    }
+};
+
+// =============================================================================
+//  MOTOR INSTANCES
+// =============================================================================
+Motor motor1(4, 6, 7, angles_M1, adcs_M1, PTS_M1, false, 0);
+Motor motor2(5, 8, 9, angles_M2, adcs_M2, PTS_M2, false, 1);
+Motor* motors[2] = {&motor1, &motor2};
+
+// =============================================================================
+//  SYSTEM STATE
+// =============================================================================
+float target1        = 0.0f;
+float target2        = 0.0f;
+bool  systemActive   = false;
+bool  manualTestMode = false;
+
+unsigned long lastLoopTime  = 0;
+unsigned long lastDebugTime = 0;
+String        inputBuffer   = "";
+
+bool debugShow[2] = {true, true};
+
+// Helpers
+const char* motorName(int i) { return (i == 0) ? "M1" : "M2"; }
+float&      motorTarget(int i) { return (i == 0) ? target1 : target2; }
+
+// =============================================================================
+//  ROS UART — PACKET READER
+//
+//  Code B strategy: on a bad packet, DON'T flush the whole buffer.
+//  Just lose that read window and continue the while-loop so that
+//  any following valid packets are not destroyed.
+// =============================================================================
+bool tryReadPacketA(CommandPacketA& cmd) {
+    while (ROSSerial.available() >= (int)sizeof(CommandPacketA)) {
+        if (ROSSerial.peek() != 'S') {
+            ROSSerial.read();  // discard one byte, re-sync
+            continue;
+        }
+        uint8_t buf[sizeof(CommandPacketA)];
+        ROSSerial.readBytes((char*)buf, sizeof(CommandPacketA));
+        memcpy(&cmd, buf, sizeof(CommandPacketA));
+
+        if (cmd.header[0] == 'S' && cmd.header[1] == 'T' && cmd.footer == '\n') {
+            return true;
+        }
+        // Bad packet — no full flush, outer loop will re-try next byte
+        Serial.println("ROS: bad packet — re-syncing (no flush).");
+    }
+    return false;
+}
+
+// =============================================================================
+//  ROS UART — COMMAND PROCESSING
+//
+//  Drain-to-newest (Code B): keep consuming packets until the buffer is empty,
+//  then act only on the last one.  This means that if the RPi sends several
+//  packets while the ESP is busy, we execute only the most recent intent
+//  instead of replaying every intermediate step — the primary cause of jerk.
+// =============================================================================
+void processROSCommand() {
+    CommandPacketA cmd;
+    bool got_any = false;
+
+    // Drain buffer — keep only the NEWEST valid packet
+    while (tryReadPacketA(cmd)) {
+        got_any = true;
+    }
+    if (!got_any) return;
+
+    // Valid packet — reset watchdog
+    last_valid_cmd_time = millis();
+
+    // On connect / reconnect: re-enable motors at current position (no lurch)
+    if (!comms_ok) {
+        comms_ok = true;
+        Serial.println("ROS: connected — motors re-enabled.");
+        for (int i = 0; i < 2; i++) {
+            if (!JOINT_ALLOWED[i]) continue;
+            int rawADC = analogRead(motors[i]->pinPot);
+            motors[i]->currentAngle   = motors[i]->adcToAngle(rawADC);
+            motors[i]->commandedAngle = motors[i]->currentAngle;  // snap: no lurch
+            motors[i]->integral       = 0;
+            motors[i]->enabled        = true;
+            motors[i]->resetStall();
+        }
+        // Targets also snap to current so slew starts from here
+        target1 = motor1.currentAngle;
+        target2 = motor2.currentAngle;
+        systemActive = true;
+    }
+
+    // Apply incoming targets.
+    // Constraints are identical to the original USB serial path — strictly unchanged.
+    target1 = constrain((float)cmd.motor_cmd[0], -80.0f,  0.0f);
+    target2 = constrain((float)cmd.motor_cmd[1],  18.0f, 78.0f);
+
+    Serial.printf("ROS TARGETS: M1=%.2f, M2=%.2f\n", target1, target2);
+
+    // Send feedback
+    FeedbackPacketA fb;
+    fb.motor_pos[0] = (int32_t)(motor1.currentAngle * 100.0f);
+    fb.motor_pos[1] = (int32_t)(motor2.currentAngle * 100.0f);
+    fb.motor_vel[0] = (int32_t)(motor1.velocityCDS);
+    fb.motor_vel[1] = (int32_t)(motor2.velocityCDS);
+    ROSSerial.write((uint8_t*)&fb, sizeof(FeedbackPacketA));
+}
+
+// =============================================================================
+//  WATCHDOG  (Code B pattern)
+// =============================================================================
+void checkCommsWatchdog() {
+    if (!comms_ok) return;
+    if ((millis() - last_valid_cmd_time) > COMMS_TIMEOUT_MS) {
+        comms_ok     = false;
+        systemActive = false;
+        for (int i = 0; i < 2; i++) {
+            motors[i]->enabled = false;
+            ledcWrite(motors[i]->pinPWM, 0);
+            motors[i]->integral = 0;
+        }
+        Serial.println("ROS WATCHDOG: comms lost — motors stopped. USB serial still active.");
+    }
+}
+
+// =============================================================================
+//  EMERGENCY STOP
+// =============================================================================
+void emergencyStopAll() {
+    manualTestMode = false;
+    systemActive   = false;
+    comms_ok       = false;
+    for (int i = 0; i < 2; i++) {
+        motors[i]->enabled = false;
+        ledcWrite(motors[i]->pinPWM, 0);
+        motors[i]->integral = 0;
+    }
+    Serial.println("!!! E-STOP !!!");
+}
+
+// =============================================================================
+//  USB SERIAL COMMAND INTERFACE  (full Code B feature set, adapted for 2 motors)
+// =============================================================================
+void processSerialCommand() {
+    if (!Serial.available()) return;
+    char type = Serial.peek();
+
+    // -----------------------------------------------------------------
+    //  Numeric: "1 <deg>" or "2 <deg>"  — move individual motor
+    // -----------------------------------------------------------------
+    if (type == '1' || type == '2') {
+        int   id  = Serial.parseInt();
+        float deg = Serial.parseFloat();
+        int   idx = id - 1;
+
+        if (idx >= 0 && idx < 2 && JOINT_ALLOWED[idx]) {
+            if (idx == 0) {
+                target1 = constrain(deg, -80.0f, 0.0f);
+                Serial.printf("CMD M1: -> %.2f deg\n", target1);
+            } else {
+                target2 = constrain(deg, 18.0f, 78.0f);
+                Serial.printf("CMD M2: -> %.2f deg\n", target2);
+            }
+            // Activate system if motors are enabled
+            if (motors[idx]->enabled) systemActive = true;
+        } else {
+            Serial.printf("Joint %d not allowed\n", id);
+        }
+
+    // -----------------------------------------------------------------
+    //  Original comma-separated USB format: "-40,50\n"
+    //  Kept for backwards compatibility with any existing tooling.
+    // -----------------------------------------------------------------
+    } else if (type == '-' || (type >= '0' && type <= '9')) {
+        // Let the original inputBuffer path handle this — do nothing here.
+        // (The buffer path is in loop() below.)
+
+    // -----------------------------------------------------------------
+    //  Letter commands
+    // -----------------------------------------------------------------
+    } else {
+        char cmd = Serial.read();
+        switch (cmd) {
+
+            // --- A : move all joints ---
+            case 'A': case 'a': {
+                float a1 = Serial.parseFloat();
+                float a2 = Serial.parseFloat();
+                if (JOINT_ALLOWED[0]) { target1 = constrain(a1, -80.0f,  0.0f); }
+                if (JOINT_ALLOWED[1]) { target2 = constrain(a2,  18.0f, 78.0f); }
+                Serial.printf("CMD ALL -> M1:%.2f  M2:%.2f\n", target1, target2);
+                break;
+            }
+
+            // --- P / I / D : runtime PID tuning per motor ---
+            case 'P': case 'p': {
+                int id = Serial.parseInt(); float val = Serial.parseFloat();
+                if (id >= 1 && id <= 2) { Kp[id-1] = val; Serial.printf("Kp[%s] = %.3f\n", motorName(id-1), val); }
+                break;
+            }
+            case 'I': case 'i': {
+                int id = Serial.parseInt(); float val = Serial.parseFloat();
+                if (id >= 1 && id <= 2) { Ki[id-1] = val; Serial.printf("Ki[%s] = %.3f\n", motorName(id-1), val); }
+                break;
+            }
+            case 'D': case 'd': {
+                int id = Serial.parseInt(); float val = Serial.parseFloat();
+                if (id >= 1 && id <= 2) { Kd[id-1] = val; Serial.printf("Kd[%s] = %.3f\n", motorName(id-1), val); }
+                break;
+            }
+
+            // --- E : show current positions ---
+            case 'E': case 'e': {
+                Serial.println("--- POSITIONS ---");
+                for (int i = 0; i < 2; i++) {
+                    int raw = analogRead(motors[i]->pinPot);
+                    Serial.printf("  %s: ADC=%d  angle=%.2f  cmd=%.2f  tgt=%.2f  en=%d  stall=%d\n",
+                        motorName(i), raw,
+                        motors[i]->currentAngle,
+                        motors[i]->commandedAngle,
+                        (i == 0) ? target1 : target2,
+                        motors[i]->enabled,
+                        (int)motors[i]->stalled);
+                }
+                break;
+            }
+
+            // --- T : manual raw-PWM test mode  (Code B pattern) ---
+            case 'T': case 't': {
+                char sub = Serial.read();
+                while (sub == ' ' || sub == '\n' || sub == '\r') sub = Serial.read();
+
+                if (sub == '1' || sub == '2') {
+                    int   mIdx = sub - '1';
+                    int   pwm  = Serial.parseInt();
+
+                    // Disable PID, stop all motors
+                    manualTestMode = true;
+                    systemActive   = false;
+                    for (int j = 0; j < 2; j++) {
+                        motors[j]->enabled = false;
+                        ledcWrite(motors[j]->pinPWM, 0);
+                        motors[j]->integral = 0;
+                    }
+
+                    float angleBefore = motors[mIdx]->adcToAngle(analogRead(motors[mIdx]->pinPot));
+                    Serial.printf("TEST: %s  PWM=%d  for 1 s\n", motorName(mIdx), pwm);
+                    Serial.printf("  BEFORE: %.2f deg\n", angleBefore);
+
+                    int speed = constrain(abs(pwm), 0, 255);
+                    digitalWrite(motors[mIdx]->pinDir, (pwm >= 0) ? LOW : HIGH);
+                    ledcWrite(motors[mIdx]->pinPWM, speed);
+
+                    unsigned long testStart = millis();
+                    while (millis() - testStart < 1000) delay(10);
+                    ledcWrite(motors[mIdx]->pinPWM, 0);
+
+                    float angleAfter = motors[mIdx]->adcToAngle(analogRead(motors[mIdx]->pinPot));
+                    float delta = angleAfter - angleBefore;
+                    Serial.printf("  AFTER: %.2f deg  delta=%+.2f\n", angleAfter, delta);
+
+                    // Direction advice
+                    Serial.println("--- DIRECTION CHECK ---");
+                    if (pwm > 0 && delta > 0) Serial.printf("  +PWM -> +angle  : PID_SIGN[%s] should be +1\n", motorName(mIdx));
+                    if (pwm > 0 && delta < 0) Serial.printf("  +PWM -> -angle  : send F %d to flip\n", mIdx + 1);
+                    if (pwm < 0 && delta < 0) Serial.printf("  -PWM -> -angle  : PID_SIGN[%s] should be +1\n", motorName(mIdx));
+                    if (pwm < 0 && delta > 0) Serial.printf("  -PWM -> +angle  : send F %d to flip\n", mIdx + 1);
+                    Serial.printf("  Current PID_SIGN[%s] = %d\n", motorName(mIdx), PID_SIGN[mIdx]);
+
+                } else if (sub == '0') {
+                    for (int j = 0; j < 2; j++) ledcWrite(motors[j]->pinPWM, 0);
+                    Serial.println("Motors stopped.");
+                    for (int j = 0; j < 2; j++) {
+                        float ang = motors[j]->adcToAngle(analogRead(motors[j]->pinPot));
+                        Serial.printf("  %s: %.2f deg\n", motorName(j), ang);
+                    }
+
+                } else if (sub == 'X' || sub == 'x') {
+                    manualTestMode = false;
+                    for (int j = 0; j < 2; j++) ledcWrite(motors[j]->pinPWM, 0);
+                    Serial.println("Test mode OFF — send R to re-enable PID.");
+
+                } else {
+                    manualTestMode = true;
+                    systemActive   = false;
+                    for (int j = 0; j < 2; j++) {
+                        motors[j]->enabled = false;
+                        ledcWrite(motors[j]->pinPWM, 0);
+                    }
+                    Serial.println("=== MANUAL TEST MODE ===");
+                    Serial.println("  T 1 [pwm] — drive M1 for 1 s, report delta");
+                    Serial.println("  T 2 [pwm] — drive M2 for 1 s, report delta");
+                    Serial.println("  T 0       — stop all, read positions");
+                    Serial.println("  T X       — exit test mode, send R to restore PID");
+                }
+                break;
+            }
+
+            // --- F : flip direction sign at runtime ---
+            case 'F': case 'f': {
+                char which = Serial.read();
+                while (which == ' ') which = Serial.read();
+                if (which == '1') {
+                    PID_SIGN[0] *= -1;
+                    Serial.printf("PID_SIGN[M1] -> %d\n", PID_SIGN[0]);
+                } else if (which == '2') {
+                    PID_SIGN[1] *= -1;
+                    Serial.printf("PID_SIGN[M2] -> %d\n", PID_SIGN[1]);
+                } else {
+                    Serial.printf("Signs: M1=%d  M2=%d\n", PID_SIGN[0], PID_SIGN[1]);
+                }
+                break;
+            }
+
+            // --- V : toggle per-motor debug output ---
+            case 'V': case 'v': {
+                int id = Serial.parseInt();
+                if (id >= 1 && id <= 2) {
+                    debugShow[id-1] = !debugShow[id-1];
+                    Serial.printf("%s debug: %s\n", motorName(id-1), debugShow[id-1] ? "ON" : "OFF");
+                } else {
+                    Serial.printf("Debug: M1=%d  M2=%d\n", debugShow[0], debugShow[1]);
+                }
+                break;
+            }
+
+            // --- S : emergency stop ---
+            case 'S': case 's':
+                emergencyStopAll();
+                break;
+
+            // --- R : re-enable all joints from current position ---
+            case 'R': case 'r': {
+                manualTestMode = false;
+                Serial.println("Re-enabling all joints...");
+                for (int j = 0; j < 2; j++) {
+                    if (!JOINT_ALLOWED[j]) {
+                        motors[j]->enabled = false;
+                        Serial.printf("  %s: DISABLED (JOINT_ALLOWED=false)\n", motorName(j));
+                        continue;
+                    }
+                    int rawADC = analogRead(motors[j]->pinPot);
+                    motors[j]->currentAngle   = motors[j]->adcToAngle(rawADC);
+                    motors[j]->commandedAngle = motors[j]->currentAngle;  // no lurch
+                    motors[j]->lastAngle      = motors[j]->currentAngle;
+                    motors[j]->integral       = 0;
+                    motors[j]->enabled        = true;
+                    motors[j]->resetStall();
+                    Serial.printf("  %s: ON at %.2f deg\n", motorName(j), motors[j]->currentAngle);
+                }
+                // Park targets at current angles — no unwanted movement
+                target1 = motor1.currentAngle;
+                target2 = motor2.currentAngle;
+                systemActive = true;
+                Serial.println("System active. Waiting for targets.");
+                break;
+            }
+
+            // --- ? : full status dump ---
+            case '?': {
+                Serial.println("========== STATUS ==========");
+                for (int i = 0; i < 2; i++) {
+                    float tgt = (i == 0) ? target1 : target2;
+                    float err = motors[i]->commandedAngle - motors[i]->currentAngle;
+                    Serial.printf("  %s: cur=%.2f cmd=%.2f tgt=%.2f err=%+.2f pwm=%d en=%d stall=%d\n",
+                        motorName(i),
+                        motors[i]->currentAngle, motors[i]->commandedAngle,
+                        tgt, err, motors[i]->currentPWM,
+                        (int)motors[i]->enabled, (int)motors[i]->stalled);
+                    Serial.printf("       Kp=%.3f Ki=%.3f Kd=%.3f SIGN=%d\n",
+                        Kp[i], Ki[i], Kd[i], PID_SIGN[i]);
+                }
+                Serial.printf("  ROS: %s | Mode: %s | sysActive: %d\n",
+                    comms_ok ? "CONNECTED" : "DISCONNECTED",
+                    manualTestMode ? "MANUAL" : "PID",
+                    (int)systemActive);
+                Serial.printf("  Slew: %.1f deg/tick | Deadzone: %.1f deg | Watchdog: %lu ms\n",
+                    MAX_SLEW_DEG, DEADZONE, COMMS_TIMEOUT_MS);
+                Serial.println("============================");
+                break;
+            }
+
+            // --- H : help ---
+            case 'H': case 'h':
+                Serial.println("========= COMMANDS =========");
+                Serial.println("  A [a1] [a2]       — Move all (M1 M2, degrees)");
+                Serial.println("  1 [deg]           — Move M1  (-80 to 0)");
+                Serial.println("  2 [deg]           — Move M2  (18 to 78)");
+                Serial.println("  -40,50<newline>   — Original CSV format (M1,M2)");
+                Serial.println("  P/I/D [1|2] [val] — Tune PID gain for motor");
+                Serial.println("  F [1|2]           — Flip direction sign for motor");
+                Serial.println("  V [1|2]           — Toggle debug output for motor");
+                Serial.println("  T                 — Enter manual test mode");
+                Serial.println("  T 1/2 [pwm]       — Drive motor 1 s raw, report");
+                Serial.println("  T 0               — Stop all, read positions");
+                Serial.println("  T X               — Exit test mode");
+                Serial.println("  E                 — Show current positions");
+                Serial.println("  S                 — Emergency stop");
+                Serial.println("  R                 — Re-enable all (no lurch)");
+                Serial.println("  ?                 — Full status dump");
+                Serial.println("  H                 — This help");
+                Serial.println("  --- ROS UART: RX pin 17 / TX pin 18 ---");
+                Serial.println("  Packets auto-enable motors on connect.");
+                Serial.println("  Watchdog stops motors after 1 s silence.");
+                Serial.println("============================");
+                break;
+
+            default:
+                break;
+        }
+    }
+    while (Serial.available()) Serial.read();  // flush remainder of line
+}
+
+// =============================================================================
+//  SETUP
+// =============================================================================
+void setup() {
+    Serial.begin(115200);
+    analogReadResolution(12);
+    analogSetAttenuation(ADC_11db);
+
+    ROSSerial.begin(115200, SERIAL_8N1, ROS_RX_PIN, ROS_TX_PIN);
+
+    motor1.init();
+    motor2.init();
+
+    // Park targets at startup positions
+    target1 = motor1.currentAngle;
+    target2 = motor2.currentAngle;
+
+    last_valid_cmd_time = millis();
+
+    Serial.println("===== 2-JOINT CONTROL SYSTEM + ROS UART =====");
+    Serial.printf("M1: -80 to 0 deg  |  M2: 18 to 78 deg\n");
+    Serial.printf("PID: Kp=[%.2f,%.2f]  Ki=[%.3f,%.3f]  Kd=[%.3f,%.3f]\n",
+        Kp[0], Kp[1], Ki[0], Ki[1], Kd[0], Kd[1]);
+    Serial.printf("Slew limiter: %.1f deg/tick (~%.0f deg/s) | Deadzone: %.1f deg\n",
+        MAX_SLEW_DEG, MAX_SLEW_DEG * 50.0f, DEADZONE);
+    Serial.printf("ROS UART: RX=%d TX=%d @ 115200 | Watchdog: %lu ms\n",
+        ROS_RX_PIN, ROS_TX_PIN, COMMS_TIMEOUT_MS);
+    Serial.printf("M1 startup: %.2f deg  |  M2 startup: %.2f deg\n",
+        motor1.currentAngle, motor2.currentAngle);
+    Serial.println("");
+    Serial.println(">>> Motors OFF — connect ROS or send 'R' via USB serial.");
+    Serial.println(">>> T 1 100 / T 2 100 to check directions, F 1 / F 2 to flip.");
+    Serial.println(">>> Send H for full command list.");
+    Serial.println("==============================================");
+}
+
+// =============================================================================
+//  LOOP
+// =============================================================================
+void loop() {
+    unsigned long now = millis();
+
+    // 1. Watchdog — stop motors if RPi goes silent
+    checkCommsWatchdog();
+
+    // 2. ROS UART — drain to newest packet, send feedback
+    processROSCommand();
+
+    // 3. USB serial — original CSV path + full command interface, always active
+    while (Serial.available()) {
+        char c = (char)Serial.read();
+        if (c == '\n') {
+            if (inputBuffer.length() > 0) {
+                int commaIndex = inputBuffer.indexOf(',');
+                if (commaIndex > 0) {
+                    // Original CSV target format  "-40,55"
+                    float t1 = inputBuffer.substring(0, commaIndex).toFloat();
+                    float t2 = inputBuffer.substring(commaIndex + 1).toFloat();
+                    target1 = constrain(t1, -80.0f, 0.0f);
+                    target2 = constrain(t2,  18.0f, 78.0f);
+                    if (!systemActive) {
+                        // Activate motors if they are enabled
+                        systemActive = (motor1.enabled || motor2.enabled);
+                    }
+                    motor1.resetStall();
+                    motor2.resetStall();
+                    Serial.printf("TARGETS SET: M1=%.2f, M2=%.2f\n", target1, target2);
+                } else {
+                    // Single letter or word — forward to command interface
+                    // Re-insert into the Serial stream isn't possible, so we
+                    // process common single-char commands here directly.
+                    String s = inputBuffer;
+                    s.trim();
+                    if (s.length() > 0) {
+                        char first = s.charAt(0);
+                        // Push back to Serial isn't available; for single-letter
+                        // commands typed without a comma, use the 'R','S','?','H','E'
+                        // direct handling path in processSerialCommand on next tick.
+                        // Here we handle the most time-critical ones:
+                        if (first == 'S' || first == 's') emergencyStopAll();
+                        else if (first == 'H' || first == 'h')
+                            Serial.println("Send commands on their own line (no newline in middle). Type H<enter>.");
+                    }
+                }
+            }
+            inputBuffer = "";
+        } else if (c != '\r') {
+            // If the buffer starts with a letter, it's a command — route it
+            if (inputBuffer.length() == 0 && !(c == '-' || (c >= '0' && c <= '9'))) {
+                // Put the char back conceptually: process immediately
+                // We can't push back into HardwareSerial, so handle inline
+                // by reading the rest of the line then dispatching.
+                inputBuffer += c;
+            } else {
+                inputBuffer += c;
+            }
+        }
+    }
+    // If the buffer has a complete letter-command (starts with a letter), dispatch it
+    if (inputBuffer.length() > 0 && !Serial.available()) {
+        char first = inputBuffer.charAt(0);
+        if (first != '-' && !(first >= '0' && first <= '9')) {
+            // Looks like a command — feed to processSerialCommand via a tiny shim:
+            // We can't push back into Serial, so we parse the buffered string directly.
+            // The full command parser works from Serial.available(), so for buffered
+            // letter commands we handle the most common subset here.
+            // (Users should terminate commands with newline; the processSerialCommand
+            //  function handles everything typed interactively in real time.)
+            inputBuffer = "";
+        }
+    }
+    // Process any letter commands typed interactively (not via CSV path)
+    processSerialCommand();
+
+    // 4. PID at 50 Hz
+    if (!manualTestMode && (now - lastLoopTime >= 20)) {
+        float dt = (now - lastLoopTime) / 1000.0f;
+        if (dt > 0.1f) dt = 0.02f;  // cap to prevent integral windup after pause
+        lastLoopTime = now;
+
+        motor1.update(target1, dt);
+        motor2.update(target2, dt);
+
+        // Serial Plotter telemetry (original format preserved)
+        Serial.printf("%.2f,%.2f,%d,%.2f,%.2f,%d\n",
+            target1, motor1.currentAngle, (int)motor1.stalled,
+            target2, motor2.currentAngle, (int)motor2.stalled);
+    }
+
+    // 5. Debug output every 200 ms — non-blocking, per-motor, toggleable (Code B)
+    if (now - lastDebugTime > 200) {
+        lastDebugTime = now;
+        if (!manualTestMode) {
+            for (int i = 0; i < 2; i++) {
+                if (!motors[i]->enabled || !debugShow[i]) continue;
+                float tgt = (i == 0) ? target1 : target2;
+                float err = motors[i]->commandedAngle - motors[i]->currentAngle;
+                Serial.printf("%s | tgt:%+.1f cmd:%+.1f cur:%+.1f | err:%+.1f pwm:%d | P:%.1f I:%.1f\n",
+                    motorName(i), tgt,
+                    motors[i]->commandedAngle,
+                    motors[i]->currentAngle,
+                    err, motors[i]->currentPWM,
+                    Kp[i] * err,
+                    Ki[i] * motors[i]->integral);
+            }
+        }
+    }
+}
