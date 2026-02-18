@@ -57,6 +57,7 @@ void test_joint_pid() {
     // commanded_pos is 1000. Set target and commanded to 1100 to simulate a jump or after slew.
     j.commanded_pos = 1100;
     j.current_pos = 1000;
+    j.prev_pos = 1000;
     
     // error = 100. Kp[1] = 4.0. error_dz = applyDeadzone(100, 5) = 95.
     // p_term = 4.0 * 95 = 380. 
@@ -70,6 +71,14 @@ void test_joint_pid() {
     j.prev_pos = 1098;    // Zero out D-term for this test
     j.computePID(0.02);
     assert(j.pid_output == 0.0f);
+    
+    // Test Integral (Ki[1] = 0.02)
+    j.current_pos = 1090; // error = 10. error_dz = 5.
+    j.prev_pos = 1090;
+    j.integral = 0;
+    // integral += 5 * 0.02 = 0.1
+    j.computePID(0.02);
+    assert(j.integral > 0);
     
     std::cout << "  Passed!" << std::endl;
 }
@@ -98,11 +107,38 @@ void test_m3_wrapping() {
     std::cout << "  Passed!" << std::endl;
 }
 
+void test_safety_limits() {
+    std::cout << "Testing Safety Limits..." << std::endl;
+    
+    // M3 (Joint 0)
+    Joint m3(0);
+    m3.enabled = true;
+    m3.continuous_pos = M3_CONT_LIMIT + 10;
+    m3.pid_output = 100; 
+    
+    // computePID calls applyM3Safety
+    m3.continuous_cmd = m3.continuous_pos + 10;
+    m3.computePID(0.02);
+    assert(m3.pid_output <= 0);
+    
+    // Pitch (Joint 1)
+    Joint pitch(1);
+    pitch.enabled = true;
+    pitch.current_pos = PITCH_LIMIT_MAX + 10;
+    pitch.pid_output = 100;
+    pitch.commanded_pos = pitch.current_pos + 10;
+    pitch.computePID(0.02);
+    assert(pitch.pid_output <= 0);
+
+    std::cout << "  Passed!" << std::endl;
+}
+
 int main() {
     test_joint_reset();
     test_joint_trajectory();
     test_joint_pid();
     test_m3_wrapping();
+    test_safety_limits();
     std::cout << "All Joint tests passed!" << std::endl;
     return 0;
 }

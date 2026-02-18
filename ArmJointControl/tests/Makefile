@@ -1,25 +1,31 @@
 CXX = g++
 CXXFLAGS = -Wall -Imocks -I../include -std=c++11
+BUILD_DIR = build
 
 UTILS_SRC = ../src/Utils.cpp
 JOINT_SRC = ../src/Joint.cpp
 MOCK_HARDWARE_SRC = mocks/Hardware.cpp
 
-all: run_tests
+TARGETS = $(BUILD_DIR)/test_utils $(BUILD_DIR)/test_joint $(BUILD_DIR)/test_comms
 
-test_utils: test_utils.cpp $(UTILS_SRC)
+all: $(BUILD_DIR) $(TARGETS) run_tests
+
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
+$(BUILD_DIR)/test_utils: test_utils.cpp $(UTILS_SRC)
 	$(CXX) $(CXXFLAGS) $^ -o $@
 
-test_joint: test_joint.cpp $(JOINT_SRC) $(UTILS_SRC) $(MOCK_HARDWARE_SRC)
+$(BUILD_DIR)/test_joint: test_joint.cpp $(JOINT_SRC) $(UTILS_SRC) $(MOCK_HARDWARE_SRC)
 	$(CXX) $(CXXFLAGS) $^ -o $@
 
-test_comms: test_comms.cpp
+$(BUILD_DIR)/test_comms: test_comms.cpp
 	$(CXX) $(CXXFLAGS) $^ -o $@
 
-run_tests: test_utils test_joint test_comms
-	./test_utils
-	./test_joint
-	./test_comms
+run_tests: $(TARGETS)
+	$(BUILD_DIR)/test_utils
+	$(BUILD_DIR)/test_joint
+	$(BUILD_DIR)/test_comms
 
 clean:
-	rm -f test_utils test_joint
+	rm -rf $(BUILD_DIR)
