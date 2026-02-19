@@ -22,9 +22,9 @@ void setup() {
             if (val != -1) {
                 joints[i].current_pos = val;
                 if (i == 0) joints[i].m3Init(val);
-                Serial.printf("  J%d: OK at %.1f", i, jointStepsToDeg(i, (float)val, joints[i].continuous_pos));
+                Serial.print("  J%d: OK at %.1f", i, jointStepsToDeg(i, (float)val, joints[i].continuous_pos));
             } else {
-                Serial.printf("  J%d: ENCODER FAIL", i);
+                Serial.print("  J%d: ENCODER FAIL", i);
             }
         }
     }
